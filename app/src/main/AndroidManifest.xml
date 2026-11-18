@@ -21,6 +21,10 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".LimitsActivity"
+            android:exported="false" />
+
         <service
             android:name=".BlockerService"
             android:exported="false"
