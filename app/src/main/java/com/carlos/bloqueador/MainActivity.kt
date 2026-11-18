@@ -65,6 +65,13 @@ class MainActivity : Activity() {
         root.addView(startBtn)
 
         root.addView(Button(this).apply {
+            text = "Límites diarios"
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, LimitsActivity::class.java))
+            }
+        })
+
+        root.addView(Button(this).apply {
             text = "1) Activar servicio de accesibilidad"
             setOnClickListener {
                 startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
