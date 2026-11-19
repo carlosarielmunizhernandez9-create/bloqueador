@@ -37,11 +37,13 @@ class BlockerService : AccessibilityService() {
     private val spaces = Regex("\\s+")
     private val handler = Handler(Looper.getMainLooper())
     private var lastToast = 0L
+    private var lastError = 0L
     private var currentPkg: String? = null
     private var lastTick = 0L
     private var lastScan = 0L
     private var lastScanPkg: String? = null
     private var lastScanResult = false
+    private var nodeBudget = 0
 
     // Cada segundo: revisa qué app está en pantalla, aunque no llegue ningún aviso
     private val tick = object : Runnable {
@@ -50,11 +52,11 @@ class BlockerService : AccessibilityService() {
                 val pm = getSystemService(POWER_SERVICE) as PowerManager
                 if (pm.isInteractive) {
                     val pkg = rootInActiveWindow?.packageName?.toString()
-                    if (pkg != null) handlePackage(pkg)
+                    if (pkg != null) handlePackage(pkg, true)
                 }
                 accumulate()
-            } catch (e: Exception) {
-                // si algo falla, el ciclo sigue
+            } catch (e: Throwable) {
+                reportError(e)
             }
             handler.postDelayed(this, 1000)
         }
@@ -73,15 +75,20 @@ class BlockerService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = event?.packageName?.toString() ?: return
-        handlePackage(pkg)
+        try {
+            val pkg = event?.packageName?.toString() ?: return
+            // Solo se lee el texto de la pantalla cuando cambia de ventana
+            handlePackage(pkg, event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
+        } catch (e: Throwable) {
+            reportError(e)
+        }
     }
 
     private fun isIgnored(pkg: String): Boolean =
         pkg.startsWith("com.android.systemui") ||
                 pkg.contains("inputmethod") || pkg.contains("keyboard")
 
-    private fun handlePackage(pkg: String) {
+    private fun handlePackage(pkg: String, allowScan: Boolean) {
         if (isIgnored(pkg)) return
 
         if (pkg != currentPkg) {
@@ -104,7 +111,7 @@ class BlockerService : AccessibilityService() {
             goHome(null)
             return
         }
-        if (guardedPrefixes.any { pkg.startsWith(it) } && screenIsGuarded(pkg)) {
+        if (allowScan && guardedPrefixes.any { pkg.startsWith(it) } && screenIsGuarded(pkg)) {
             goHome(null)
         }
     }
@@ -123,10 +130,11 @@ class BlockerService : AccessibilityService() {
 
     private fun screenIsGuarded(pkg: String): Boolean {
         val now = SystemClock.elapsedRealtime()
-        if (pkg == lastScanPkg && now - lastScan < 300) return lastScanResult
+        if (pkg == lastScanPkg && now - lastScan < 800) return lastScanResult
         val root = rootInActiveWindow ?: return false
         val sb = StringBuilder()
-        collect(root, sb, 0)
+        nodeBudget = 600
+        collect(root, sb)
         val text = spaces.replace(sb.toString().lowercase(), " ")
         val result = guardedGroups.any { group -> group.all { text.contains(it) } }
         lastScan = now
@@ -135,12 +143,13 @@ class BlockerService : AccessibilityService() {
         return result
     }
 
-    private fun collect(node: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {
-        if (node == null || depth > 40 || sb.length > 20000) return
+    private fun collect(node: AccessibilityNodeInfo?, sb: StringBuilder) {
+        if (node == null || nodeBudget <= 0) return
+        nodeBudget--
         node.text?.let { sb.append(it).append(' ') }
         node.contentDescription?.let { sb.append(it).append(' ') }
         for (i in 0 until node.childCount) {
-            collect(node.getChild(i), sb, depth + 1)
+            collect(node.getChild(i), sb)
         }
     }
 
@@ -152,6 +161,18 @@ class BlockerService : AccessibilityService() {
             val text = msg ?: "Bloqueado. Quedan ${BlockStore.remainingMinutes(this)} min."
             Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    // Muestra el error en pantalla para poder diagnosticarlo
+    private fun reportError(e: Throwable) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastError < 10_000L) return
+        lastError = now
+        Toast.makeText(
+            this,
+            "Error: ${e.javaClass.simpleName} ${e.message}",
+            Toast.LENGTH_LONG
+        ).show()
     }
 
     override fun onInterrupt() {}
