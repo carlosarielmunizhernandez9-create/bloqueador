@@ -11,7 +11,12 @@ import android.widget.Toast
 
 class BlockerService : AccessibilityService() {
 
-    // Pantallas de sistema donde puede aparecer "Bloqueador"
+    // Apps que se cierran por completo mientras corre el temporizador de bloqueo
+    private val alwaysBlockedPrefixes = listOf(
+        "com.google.android.apps.wellbeing"
+    )
+
+    // Paquetes de sistema donde se revisa el texto de la pantalla
     private val guardedPrefixes = listOf(
         "com.android.settings",
         "com.android.packageinstaller",
@@ -20,22 +25,38 @@ class BlockerService : AccessibilityService() {
         "com.android.permissioncontroller",
         "com.coloros", "com.oplus", "com.heytap", "com.oppo"
     )
-    private val keywords = listOf("bloqueador")
 
+    // Una pantalla se cierra si contiene TODAS las frases de algún grupo
+    private val guardedGroups = listOf(
+        listOf("bloqueador"),
+        listOf("hora automáticamente"),
+        listOf("zona horaria automáticamente"),
+        listOf("notificaciones de la aplicación", "por ubicación")
+    )
+
+    private val spaces = Regex("\\s+")
     private val handler = Handler(Looper.getMainLooper())
     private var lastToast = 0L
     private var currentPkg: String? = null
     private var lastTick = 0L
+    private var lastScan = 0L
+    private var lastScanPkg: String? = null
+    private var lastScanResult = false
 
-    // Cada 2 segundos: suma el uso y saca la app si ya llegó al límite
+    // Cada segundo: revisa qué app está en pantalla, aunque no llegue ningún aviso
     private val tick = object : Runnable {
         override fun run() {
-            accumulate()
-            val pkg = currentPkg
-            if (pkg != null && LimitStore.isOverLimit(this@BlockerService, pkg)) {
-                goHome("Límite diario alcanzado")
+            try {
+                val pm = getSystemService(POWER_SERVICE) as PowerManager
+                if (pm.isInteractive) {
+                    val pkg = rootInActiveWindow?.packageName?.toString()
+                    if (pkg != null) handlePackage(pkg)
+                }
+                accumulate()
+            } catch (e: Exception) {
+                // si algo falla, el ciclo sigue
             }
-            handler.postDelayed(this, 2000)
+            handler.postDelayed(this, 1000)
         }
     }
 
@@ -43,7 +64,7 @@ class BlockerService : AccessibilityService() {
         super.onServiceConnected()
         lastTick = SystemClock.elapsedRealtime()
         handler.removeCallbacks(tick)
-        handler.postDelayed(tick, 2000)
+        handler.postDelayed(tick, 1000)
     }
 
     override fun onDestroy() {
@@ -51,9 +72,42 @@ class BlockerService : AccessibilityService() {
         super.onDestroy()
     }
 
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        val pkg = event?.packageName?.toString() ?: return
+        handlePackage(pkg)
+    }
+
     private fun isIgnored(pkg: String): Boolean =
         pkg.startsWith("com.android.systemui") ||
                 pkg.contains("inputmethod") || pkg.contains("keyboard")
+
+    private fun handlePackage(pkg: String) {
+        if (isIgnored(pkg)) return
+
+        if (pkg != currentPkg) {
+            accumulate()
+            currentPkg = pkg
+        }
+
+        // Límite diario
+        if (LimitStore.isOverLimit(this, pkg)) {
+            goHome("Límite diario alcanzado")
+            return
+        }
+
+        // Temporizador de bloqueo total
+        if (!BlockStore.isActive(this)) return
+        if (pkg == packageName ||
+            BlockStore.isBlocked(this, pkg) ||
+            alwaysBlockedPrefixes.any { pkg.startsWith(it) }
+        ) {
+            goHome(null)
+            return
+        }
+        if (guardedPrefixes.any { pkg.startsWith(it) } && screenIsGuarded(pkg)) {
+            goHome(null)
+        }
+    }
 
     private fun accumulate() {
         val now = SystemClock.elapsedRealtime()
@@ -67,47 +121,27 @@ class BlockerService : AccessibilityService() {
         LimitStore.addUsage(this, pkg, minOf(elapsed, 5000L))
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        val pkg = event.packageName?.toString() ?: return
-
-        // 1) Seguimiento de la app en pantalla (límites diarios)
-        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && !isIgnored(pkg)) {
-            if (pkg != currentPkg) {
-                accumulate()
-                currentPkg = pkg
-            }
-            if (LimitStore.isOverLimit(this, pkg)) {
-                goHome("Límite diario alcanzado")
-                return
-            }
-        }
-
-        // 2) Temporizador de bloqueo total
-        if (!BlockStore.isActive(this)) return
-        if (pkg == packageName || BlockStore.isBlocked(this, pkg)) {
-            goHome(null)
-            return
-        }
-        if (guardedPrefixes.any { pkg.startsWith(it) } && screenMentionsKeyword()) {
-            goHome(null)
-        }
-    }
-
-    private fun screenMentionsKeyword(): Boolean {
+    private fun screenIsGuarded(pkg: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (pkg == lastScanPkg && now - lastScan < 300) return lastScanResult
         val root = rootInActiveWindow ?: return false
-        return search(root, 0)
+        val sb = StringBuilder()
+        collect(root, sb, 0)
+        val text = spaces.replace(sb.toString().lowercase(), " ")
+        val result = guardedGroups.any { group -> group.all { text.contains(it) } }
+        lastScan = now
+        lastScanPkg = pkg
+        lastScanResult = result
+        return result
     }
 
-    private fun search(node: AccessibilityNodeInfo?, depth: Int): Boolean {
-        if (node == null || depth > 40) return false
-        val text = (node.text?.toString() ?: "") + " " +
-                (node.contentDescription?.toString() ?: "")
-        if (keywords.any { text.contains(it, ignoreCase = true) }) return true
+    private fun collect(node: AccessibilityNodeInfo?, sb: StringBuilder, depth: Int) {
+        if (node == null || depth > 40 || sb.length > 20000) return
+        node.text?.let { sb.append(it).append(' ') }
+        node.contentDescription?.let { sb.append(it).append(' ') }
         for (i in 0 until node.childCount) {
-            if (search(node.getChild(i), depth + 1)) return true
+            collect(node.getChild(i), sb, depth + 1)
         }
-        return false
     }
 
     private fun goHome(msg: String?) {
