@@ -8,8 +8,19 @@ import android.os.SystemClock
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
+import java.text.Normalizer
 
 class BlockerService : AccessibilityService() {
+
+    private val spaces = Regex("\\s+")
+    private val marks = Regex("\\p{Mn}+")
+
+    // Quita acentos y mayúsculas para comparar textos sin que importe cómo estén escritos
+    private fun norm(s: String): String =
+        spaces.replace(
+            marks.replace(Normalizer.normalize(s, Normalizer.Form.NFD), "").lowercase(),
+            " "
+        )
 
     // Apps que se cierran por completo mientras corre el temporizador de bloqueo
     private val alwaysBlockedPrefixes = listOf(
@@ -32,12 +43,13 @@ class BlockerService : AccessibilityService() {
         listOf("hora automáticamente"),
         listOf("zona horaria automáticamente"),
         listOf("notificaciones de la aplicación", "por ubicación")
-    )
+    ).map { group -> group.map { norm(it) } }
 
-    private val spaces = Regex("\\s+")
     private val handler = Handler(Looper.getMainLooper())
     private var lastToast = 0L
     private var lastError = 0L
+    private var lastDiag = 0L
+    private var lastDiagPkg: String? = null
     private var currentPkg: String? = null
     private var lastTick = 0L
     private var lastScan = 0L
@@ -45,7 +57,6 @@ class BlockerService : AccessibilityService() {
     private var lastScanResult = false
     private var nodeBudget = 0
 
-    // Cada segundo: revisa qué app está en pantalla, aunque no llegue ningún aviso
     private val tick = object : Runnable {
         override fun run() {
             try {
@@ -77,7 +88,6 @@ class BlockerService : AccessibilityService() {
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         try {
             val pkg = event?.packageName?.toString() ?: return
-            // Solo se lee el texto de la pantalla cuando cambia de ventana
             handlePackage(pkg, event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)
         } catch (e: Throwable) {
             reportError(e)
@@ -87,6 +97,9 @@ class BlockerService : AccessibilityService() {
     private fun isIgnored(pkg: String): Boolean =
         pkg.startsWith("com.android.systemui") ||
                 pkg.contains("inputmethod") || pkg.contains("keyboard")
+
+    private fun isGuardedPackage(pkg: String): Boolean =
+        guardedPrefixes.any { pkg.startsWith(it) } || pkg.contains("settings")
 
     private fun handlePackage(pkg: String, allowScan: Boolean) {
         if (isIgnored(pkg)) return
@@ -111,7 +124,10 @@ class BlockerService : AccessibilityService() {
             goHome(null)
             return
         }
-        if (allowScan && guardedPrefixes.any { pkg.startsWith(it) } && screenIsGuarded(pkg)) {
+
+        if (allowScan) diagnose(pkg)   // DIAGNÓSTICO: se quita después
+
+        if (allowScan && isGuardedPackage(pkg) && screenIsGuarded(pkg)) {
             goHome(null)
         }
     }
@@ -128,14 +144,19 @@ class BlockerService : AccessibilityService() {
         LimitStore.addUsage(this, pkg, minOf(elapsed, 5000L))
     }
 
-    private fun screenIsGuarded(pkg: String): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        if (pkg == lastScanPkg && now - lastScan < 800) return lastScanResult
-        val root = rootInActiveWindow ?: return false
+    // Lee todo el texto visible de la pantalla activa (null si no se puede leer)
+    private fun readScreen(): String? {
+        val root = rootInActiveWindow ?: return null
         val sb = StringBuilder()
         nodeBudget = 600
         collect(root, sb)
-        val text = spaces.replace(sb.toString().lowercase(), " ")
+        return norm(sb.toString())
+    }
+
+    private fun screenIsGuarded(pkg: String): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (pkg == lastScanPkg && now - lastScan < 800) return lastScanResult
+        val text = readScreen() ?: return false
         val result = guardedGroups.any { group -> group.all { text.contains(it) } }
         lastScan = now
         lastScanPkg = pkg
@@ -153,6 +174,18 @@ class BlockerService : AccessibilityService() {
         }
     }
 
+    // DIAGNÓSTICO: muestra el paquete y el texto que ve el vigilante
+    private fun diagnose(pkg: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastDiag < 2500L) return
+        if (pkg == lastDiagPkg && now - lastDiag < 6000L) return
+        lastDiag = now
+        lastDiagPkg = pkg
+        val text = readScreen()
+        val shown = if (text == null) "SIN TEXTO (no pude leer la pantalla)" else text.take(90)
+        Toast.makeText(this, "DIAG $pkg | $shown", Toast.LENGTH_LONG).show()
+    }
+
     private fun goHome(msg: String?) {
         performGlobalAction(GLOBAL_ACTION_HOME)
         val now = SystemClock.elapsedRealtime()
@@ -163,7 +196,6 @@ class BlockerService : AccessibilityService() {
         }
     }
 
-    // Muestra el error en pantalla para poder diagnosticarlo
     private fun reportError(e: Throwable) {
         val now = SystemClock.elapsedRealtime()
         if (now - lastError < 10_000L) return
