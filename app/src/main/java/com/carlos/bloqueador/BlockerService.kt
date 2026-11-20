@@ -15,7 +15,7 @@ class BlockerService : AccessibilityService() {
     private val spaces = Regex("\\s+")
     private val marks = Regex("\\p{Mn}+")
 
-    // Quita acentos y mayúsculas para comparar textos sin que importe cómo estén escritos
+    // Quita acentos y mayúsculas para comparar textos
     private fun norm(s: String): String =
         spaces.replace(
             marks.replace(Normalizer.normalize(s, Normalizer.Form.NFD), "").lowercase(),
@@ -42,14 +42,16 @@ class BlockerService : AccessibilityService() {
         listOf("bloqueador"),
         listOf("hora automáticamente"),
         listOf("zona horaria automáticamente"),
-        listOf("notificaciones de la aplicación", "por ubicación")
+        listOf("notificaciones de la aplicación", "por ubicación"),
+        // Ajustes adicionales (la página anterior a Fecha y hora)
+        listOf("idiomas de la aplicación", "método de entrada"),
+        // Pantalla de apps recientes
+        listOf("cerrar todo", "gb disponible")
     ).map { group -> group.map { norm(it) } }
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastToast = 0L
     private var lastError = 0L
-    private var lastDiag = 0L
-    private var lastDiagPkg: String? = null
     private var currentPkg: String? = null
     private var lastTick = 0L
     private var lastScan = 0L
@@ -99,7 +101,8 @@ class BlockerService : AccessibilityService() {
                 pkg.contains("inputmethod") || pkg.contains("keyboard")
 
     private fun isGuardedPackage(pkg: String): Boolean =
-        guardedPrefixes.any { pkg.startsWith(it) } || pkg.contains("settings")
+        guardedPrefixes.any { pkg.startsWith(it) } ||
+                pkg.contains("settings") || pkg.contains("launcher")
 
     private fun handlePackage(pkg: String, allowScan: Boolean) {
         if (isIgnored(pkg)) return
@@ -125,8 +128,6 @@ class BlockerService : AccessibilityService() {
             return
         }
 
-        if (allowScan) diagnose(pkg)   // DIAGNÓSTICO: se quita después
-
         if (allowScan && isGuardedPackage(pkg) && screenIsGuarded(pkg)) {
             goHome(null)
         }
@@ -144,19 +145,14 @@ class BlockerService : AccessibilityService() {
         LimitStore.addUsage(this, pkg, minOf(elapsed, 5000L))
     }
 
-    // Lee todo el texto visible de la pantalla activa (null si no se puede leer)
-    private fun readScreen(): String? {
-        val root = rootInActiveWindow ?: return null
-        val sb = StringBuilder()
-        nodeBudget = 600
-        collect(root, sb)
-        return norm(sb.toString())
-    }
-
     private fun screenIsGuarded(pkg: String): Boolean {
         val now = SystemClock.elapsedRealtime()
         if (pkg == lastScanPkg && now - lastScan < 800) return lastScanResult
-        val text = readScreen() ?: return false
+        val root = rootInActiveWindow ?: return false
+        val sb = StringBuilder()
+        nodeBudget = 600
+        collect(root, sb)
+        val text = norm(sb.toString())
         val result = guardedGroups.any { group -> group.all { text.contains(it) } }
         lastScan = now
         lastScanPkg = pkg
@@ -172,18 +168,6 @@ class BlockerService : AccessibilityService() {
         for (i in 0 until node.childCount) {
             collect(node.getChild(i), sb)
         }
-    }
-
-    // DIAGNÓSTICO: muestra el paquete y el texto que ve el vigilante
-    private fun diagnose(pkg: String) {
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastDiag < 2500L) return
-        if (pkg == lastDiagPkg && now - lastDiag < 6000L) return
-        lastDiag = now
-        lastDiagPkg = pkg
-        val text = readScreen()
-        val shown = if (text == null) "SIN TEXTO (no pude leer la pantalla)" else text.take(90)
-        Toast.makeText(this, "DIAG $pkg | $shown", Toast.LENGTH_LONG).show()
     }
 
     private fun goHome(msg: String?) {
